@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""fsig: dump normalized Fortran procedure signatures (and optionally call sites).
+
+  fsig [REV:]PATH ...            one line per subroutine/function: name(args)
+  fsig --calls NAME [REV:]PATH   normalized call statements of NAME (positional
+                                 argument checks: compare against the signature)
+  fsig --diff A B                unified diff of signatures of two specs
+
+A spec is a path, or REV:PATH to read the file from git (run inside the repo).
+Continuation lines are joined, comments stripped, whitespace removed, names
+lowercased, so two revisions diff cleanly. Exit 1 on --diff differences.
+"""
+import argparse, difflib, os, re, subprocess, sys
+
+def read_spec(spec):
+    if ':' in spec and not os.path.exists(spec):
+        rev, path = spec.split(':', 1)
+        return subprocess.run(['git', 'show', f'{rev}:{path}'], check=True,
+                              capture_output=True, text=True).stdout
+    return open(spec, encoding='utf-8', errors='replace').read()
+
+def strip_comment(line):
+    out, q = [], None
+    for ch in line:
+        if q:
+            out.append(ch)
+            if ch == q: q = None
+        elif ch in ('"', "'"):
+            q = ch; out.append(ch)
+        elif ch == '!':
+            break
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+def logical_lines(text):
+    """Join free-form continuation lines; yield (first_lineno, statement)."""
+    buf, start = '', None
+    for i, raw in enumerate(text.splitlines(), 1):
+        s = strip_comment(raw).strip()
+        if not s: continue
+        if buf:
+            s = s[1:] if s.startswith('&') else s
+            buf = buf.rstrip('&').rstrip() + ' ' + s
+        else:
+            buf, start = s, i
+        if buf.rstrip().endswith('&'):
+            continue
+        yield start, buf
+        buf = ''
+    if buf: yield start, buf
+
+SIG = re.compile(r'^(?:[\w\s(),=*:]*?\b)?(subroutine|function)\s+(\w+)\s*(\([^)]*\))?\s*(result\s*\(\s*\w+\s*\))?\s*$', re.I)
+
+def signatures(text):
+    for ln, st in logical_lines(text):
+        if re.match(r'^\s*end\b', st, re.I) or re.match(r'^\s*module\s+procedure\b', st, re.I):
+            continue
+        m = SIG.match(st)
+        if not m: continue
+        kind, name, args, res = m.groups()
+        args = re.sub(r'\s+', '', args or '()')
+        res = re.sub(r'\s+', '', res or '')
+        yield ln, f'{kind.lower()} {name.lower()}{args.lower()}{res.lower()}'
+
+def calls(text, name):
+    pat = re.compile(r'^\s*call\s+' + re.escape(name) + r'\s*\((.*)\)\s*$', re.I)
+    for ln, st in logical_lines(text):
+        m = pat.match(st)
+        if m:
+            yield ln, f'call {name.lower()}(' + re.sub(r'\s+', '', m.group(1)) + ')'
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('specs', nargs='*')
+    ap.add_argument('--calls', metavar='NAME', help='print call sites of NAME instead of signatures')
+    ap.add_argument('--diff', nargs=2, metavar=('A', 'B'), help='diff signatures of two specs')
+    ap.add_argument('-n', action='store_true', help='prefix line numbers')
+    a = ap.parse_args()
+    if a.diff:
+        sa = [s for _, s in signatures(read_spec(a.diff[0]))]
+        sb = [s for _, s in signatures(read_spec(a.diff[1]))]
+        d = list(difflib.unified_diff(sa, sb, a.diff[0], a.diff[1], lineterm='', n=0))
+        print('\n'.join(d))
+        sys.exit(1 if d else 0)
+    if not a.specs: ap.error('no input specs')
+    for spec in a.specs:
+        text = read_spec(spec)
+        items = calls(text, a.calls) if a.calls else signatures(text)
+        for ln, s in items:
+            prefix = f'{spec}:{ln}: ' if (a.n or len(a.specs) > 1) else ''
+            print(prefix + s)
+
+if __name__ == '__main__':
+    main()

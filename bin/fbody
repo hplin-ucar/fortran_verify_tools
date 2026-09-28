@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""fbody: check that Fortran procedure bodies survived a move or refactor.
+
+  fbody [REV:]PATH                       list program units (lines, kind, name)
+  fbody [REV:]PATH UNIT                  print the normalized body of UNIT
+  fbody --diff [REV:]PATH UNIT [REV:]PATH2 [UNIT2]
+                                         diff UNIT against its copy in PATH2;
+                                         give UNIT2 when it was renamed
+  fbody --walk [REV:]PATH [REV:]PATH2 ...
+                                         every unit of PATH looked up by name in
+                                         PATH2...: IDENTICAL | DIFF n | NOT FOUND
+  --map OLD=NEW     treat identifiers OLD and NEW as the same on both sides
+                    (repeatable); --map r8=kind_phys also covers 1.0_r8
+  --rename OLD=NEW  with --walk: look OLD up under the name NEW (repeatable)
+  --show            with --walk: print the diff under each non-identical unit
+
+For the "copy this subroutine over there" step of a refactor, by hand or by an
+LLM.  Comments, indentation, alignment padding, continuation-line wrapping and
+letter case are normalized away before comparing, so IDENTICAL means the
+statements are the same and a diff shows only real changes (blanks inside a
+statement are collapsed to one, not removed).  A spec is a path, or REV:PATH
+read with git show from the current repo, or DIR:REV:PATH from the repo at DIR
+(PATH from the repo root), so two repos can be compared at fixed revisions.
+Free-form Fortran only.  Exit 1 when --diff differs or --walk finds a unit
+non-identical or missing; one line per unit.
+"""
+import argparse, difflib, os, re, subprocess, sys
+
+
+def read_spec(spec):
+    if ':' in spec and not os.path.exists(spec):
+        parts = spec.split(':')
+        repo = parts.pop(0) if len(parts) > 2 and os.path.isdir(parts[0]) else '.'
+        rev, path = ':'.join(parts).split(':', 1)
+        r = subprocess.run(['git', '-C', repo, 'show', f'{rev}:{path}'], capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(f'fbody: {spec}: {r.stderr.strip()}')
+        return r.stdout
+    return open(spec, encoding='utf-8', errors='replace').read()
+
+
+def strip_comment(line):
+    out, q = [], None
+    for ch in line:
+        if q:
+            out.append(ch)
+            if ch == q: q = None
+        elif ch in ('"', "'"):
+            q = ch; out.append(ch)
+        elif ch == '!':
+            break
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+
+def logical_lines(text):
+    """Join free-form continuation lines; yield (first_lineno, statement)."""
+    buf, start = '', None
+    for i, raw in enumerate(text.splitlines(), 1):
+        s = strip_comment(raw).strip()
+        if not s: continue
+        if buf:
+            s = s[1:] if s.startswith('&') else s
+            buf = buf.rstrip('&').rstrip() + ' ' + s
+        else:
+            buf, start = s, i
+        if buf.rstrip().endswith('&'):
+            continue
+        yield start, buf
+        buf = ''
+    if buf: yield start, buf
+
+
+def norm(stmt, maps=()):
+    """Lowercase and collapse blanks outside string literals, then apply --map."""
+    out, q, blank = [], None, False
+    for ch in stmt:
+        if q:
+            out.append(ch)
+            if ch == q: q = None
+            continue
+        if ch.isspace():
+            blank = True
+            continue
+        if blank and out: out.append(' ')
+        blank = False
+        if ch in ('"', "'"): q = ch
+        out.append(ch if q else ch.lower())
+    s = ''.join(out)
+    for old, new in maps:
+        s = re.sub(r'(?<![a-z0-9])' + re.escape(old) + r'(?![a-z0-9_])', new, s)
+    return s
+
+
+SIG = re.compile(r'^(?:[\w\s(),=*:]*?\b)?(subroutine|function)\s+(\w+)\s*(\([^)]*\))?\s*(result\s*\(\s*\w+\s*\))?\s*$')
+END = re.compile(r'^end(?:\s*(?:subroutine|function)(?:\s+\w+)?)?$')
+
+
+class Unit:
+    def __init__(self, name, kind, first, depth):
+        self.name, self.kind, self.first, self.depth = name, kind, first, depth
+        self.last, self.stmts = None, []
+
+    def lines(self):
+        return self.last - self.first + 1
+
+
+def units(text, maps=()):
+    """Every subroutine/function in TEXT (internal ones included, interface
+    bodies skipped), in source order, with normalized statements."""
+    done, stack, iface = [], [], 0
+    for ln, raw in logical_lines(text):
+        st = norm(raw, maps)
+        if re.match(r'^(abstract )?interface\b', st): iface += 1; continue
+        if re.match(r'^end ?interface\b', st): iface -= 1; continue
+        if iface or st.startswith('module procedure'): continue
+        ending = END.match(st)
+        m = None if ending else SIG.match(st)
+        if m:
+            stack.append(Unit(m.group(2), m.group(1), ln, len(stack)))
+        for u in stack: u.stmts.append(st)
+        if ending and stack:
+            u = stack.pop(); u.last = ln; done.append(u)
+    return sorted(done, key=lambda u: u.first)
+
+
+def find(us, name):
+    name = name.lower()
+    return [u for u in us if u.name == name]
+
+
+def unified(a, b, la, lb, fold=None):
+    """Unified diff of two units' statements; fold=(new, old) renames b's name to a's."""
+    sb = b.stmts
+    if fold:
+        pat = re.compile(r'(?<![a-z0-9_])' + re.escape(fold[0]) + r'(?![a-z0-9_])')
+        sb = [pat.sub(fold[1], s) for s in sb]
+    return list(difflib.unified_diff(a.stmts, sb, la, lb, lineterm=''))
+
+
+def changed(diff):
+    return sum(1 for l in diff if l and l[0] in '+-' and l[:3] not in ('+++', '---'))
+
+
+def label(spec, u):
+    return f'{spec}:{u.name} ({u.kind}, lines {u.first}-{u.last})'
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('args', nargs='+', metavar='SPEC/UNIT')
+    ap.add_argument('--diff', action='store_true')
+    ap.add_argument('--walk', action='store_true')
+    ap.add_argument('--map', action='append', default=[], metavar='OLD=NEW')
+    ap.add_argument('--rename', action='append', default=[], metavar='OLD=NEW')
+    ap.add_argument('--show', action='store_true')
+    a = ap.parse_args()
+    for x in a.map + a.rename:
+        if '=' not in x: ap.error(f'expected OLD=NEW, got {x}')
+    maps = [tuple(x.lower().split('=', 1)) for x in a.map]
+    renames = dict(tuple(x.lower().split('=', 1)) for x in a.rename)
+
+    if a.diff:
+        if len(a.args) not in (3, 4): ap.error('--diff takes SPEC UNIT SPEC2 [UNIT2]')
+        sa, na, sb = a.args[:3]
+        nb = a.args[3] if len(a.args) == 4 else na
+        ua = find(units(read_spec(sa), maps), na)
+        ub = find(units(read_spec(sb), maps), nb)
+        if not ua: sys.exit(f'fbody: {na} not found in {sa}')
+        if not ub: sys.exit(f'fbody: {nb} not found in {sb}')
+        fold = (nb.lower(), na.lower()) if na.lower() != nb.lower() else None
+        d = unified(ua[0], ub[0], label(sa, ua[0]), label(sb, ub[0]), fold)
+        print('\n'.join(d) if d else f'IDENTICAL  {label(sa, ua[0])} == {label(sb, ub[0])}')
+        sys.exit(1 if d else 0)
+
+    if a.walk:
+        if len(a.args) < 2: ap.error('--walk takes SPEC SPEC2 [SPEC3 ...]')
+        src = a.args[0]
+        targets = [(s, units(read_spec(s), maps)) for s in a.args[1:]]
+        bad = 0
+        for u in units(read_spec(src), maps):
+            name = renames.get(u.name, u.name)
+            hits = [(s, v) for s, vs in targets for v in find(vs, name)]
+            head = f'{u.name:<32} {u.kind:<10} {u.lines():>5}'
+            if not hits:
+                print(f'{"NOT FOUND":<10} {head}'); bad += 1; continue
+            s, v = hits[0]
+            fold = (name, u.name) if name != u.name else None
+            d = unified(u, v, label(src, u), label(s, v), fold)
+            n = changed(d)
+            verdict = 'IDENTICAL' if n == 0 else f'DIFF {n}'
+            also = '  (also in ' + ', '.join(x for x, _ in hits[1:]) + ')' if len(hits) > 1 else ''
+            where = f'{s}:{v.name}' if fold else s
+            print(f'{verdict:<10} {head} -> {v.lines():<5} {where}{also}')
+            if n:
+                bad += 1
+                if a.show: print('\n'.join('    ' + l for l in d))
+        sys.exit(1 if bad else 0)
+
+    us = units(read_spec(a.args[0]), maps)
+    if len(a.args) == 1:
+        for u in us:
+            print(f'{u.first:>5}-{u.last:<5} {u.kind:<10} {"  " * u.depth}{u.name}')
+        return
+    if len(a.args) != 2: ap.error('expected SPEC [UNIT], or --diff / --walk')
+    hit = find(us, a.args[1])
+    if not hit: sys.exit(f'fbody: {a.args[1]} not found in {a.args[0]}')
+    print('\n'.join(hit[0].stmts))
+
+
+if __name__ == '__main__':
+    main()
