@@ -36,7 +36,10 @@ def read_spec(spec):
         if r.returncode:
             sys.exit(f'fbody: {spec}: {r.stderr.strip()}')
         return r.stdout
-    return open(spec, encoding='utf-8', errors='replace').read()
+    try:
+        return open(spec, encoding='utf-8', errors='replace').read()
+    except OSError as e:
+        sys.exit(f'fbody: {spec}: {e.strerror}')
 
 
 def strip_comment(line):
