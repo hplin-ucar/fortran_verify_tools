@@ -31,7 +31,8 @@ export PATH="$PWD/shared_verify_tools/bin:$PATH"   # or call bin/fbody directly
 ```
 
 Both scripts print `--help`. Exit status is 0 when nothing differs, 1 when
-there is something to look at, 2 on a usage error.
+there is something to look at, 2 on a usage error or a file / revision that
+cannot be read (one-line message on stderr).
 
 ## fbody: procedure bodies
 
@@ -156,12 +157,13 @@ removed. Paste the walk output into the PR.
 ## fsig: signatures and call sites
 
 ```
-fsig [REV:]PATH ...              one line per subroutine/function: name(args)
-fsig --calls NAME [REV:]PATH     normalized call statements of NAME
-fsig --diff A B                  unified diff of the signatures of two specs
+fsig SPEC ...                    one line per subroutine/function: name(args)
+fsig --calls NAME SPEC           normalized call statements of NAME
+fsig --diff SPEC SPEC2           unified diff of the signatures of two specs
+                                 (no output, exit 0, when they match)
 ```
 
-Continuation lines are joined, comments stripped, all whitespace removed and
+`SPEC` takes the same three forms as for `fbody`. Continuation lines are joined, comments stripped, all whitespace removed and
 names lowercased, so signatures from two revisions diff cleanly. Use
 `--calls` next to the signature to check a positional call after an argument
 was added.

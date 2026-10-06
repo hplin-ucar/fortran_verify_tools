@@ -22,9 +22,16 @@ statement are collapsed to one, not removed).  A spec is a path, or REV:PATH
 read with git show from the current repo, or DIR:REV:PATH from the repo at DIR
 (PATH from the repo root), so two repos can be compared at fixed revisions.
 Free-form Fortran only.  Exit 1 when --diff differs or --walk finds a unit
-non-identical or missing; one line per unit.
+non-identical or missing; one line per unit.  Exit 2 on a usage error or a
+spec that cannot be read, so 1 always means something to look at.
 """
 import argparse, difflib, os, re, subprocess, sys
+
+
+def unreadable(spec, why):
+    # Exit 2, not 1: a caller must not mistake a bad spec for a finding.
+    print(f'fbody: {spec}: {why}', file=sys.stderr)
+    sys.exit(2)
 
 
 def read_spec(spec):
@@ -32,14 +39,17 @@ def read_spec(spec):
         parts = spec.split(':')
         repo = parts.pop(0) if len(parts) > 2 and os.path.isdir(parts[0]) else '.'
         rev, path = ':'.join(parts).split(':', 1)
-        r = subprocess.run(['git', '-C', repo, 'show', f'{rev}:{path}'], capture_output=True, text=True)
+        try:
+            r = subprocess.run(['git', '-C', repo, 'show', f'{rev}:{path}'], capture_output=True, text=True)
+        except OSError as e:
+            unreadable(spec, f'git: {e.strerror}')
         if r.returncode:
-            sys.exit(f'fbody: {spec}: {r.stderr.strip()}')
+            unreadable(spec, r.stderr.strip())
         return r.stdout
     try:
         return open(spec, encoding='utf-8', errors='replace').read()
     except OSError as e:
-        sys.exit(f'fbody: {spec}: {e.strerror}')
+        unreadable(spec, e.strerror)
 
 
 def strip_comment(line):

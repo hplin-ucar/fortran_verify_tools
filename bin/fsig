@@ -6,18 +6,35 @@
                                  argument checks: compare against the signature)
   fsig --diff A B                unified diff of signatures of two specs
 
-A spec is a path, or REV:PATH to read the file from git (run inside the repo).
+A spec is a path, or REV:PATH read with git show from the current repo, or
+DIR:REV:PATH from the repo at DIR (PATH from the repo root).
 Continuation lines are joined, comments stripped, whitespace removed, names
-lowercased, so two revisions diff cleanly. Exit 1 on --diff differences.
+lowercased, so two revisions diff cleanly. Exit 1 on --diff differences; exit 2
+on a usage error or a spec that cannot be read.
 """
 import argparse, difflib, os, re, subprocess, sys
 
+def unreadable(spec, why):
+    # Exit 2, not 1: a caller must not mistake a bad spec for --diff differences.
+    print(f'fsig: {spec}: {why}', file=sys.stderr)
+    sys.exit(2)
+
 def read_spec(spec):
     if ':' in spec and not os.path.exists(spec):
-        rev, path = spec.split(':', 1)
-        return subprocess.run(['git', 'show', f'{rev}:{path}'], check=True,
-                              capture_output=True, text=True).stdout
-    return open(spec, encoding='utf-8', errors='replace').read()
+        parts = spec.split(':')
+        repo = parts.pop(0) if len(parts) > 2 and os.path.isdir(parts[0]) else '.'
+        rev, path = ':'.join(parts).split(':', 1)
+        try:
+            r = subprocess.run(['git', '-C', repo, 'show', f'{rev}:{path}'], capture_output=True, text=True)
+        except OSError as e:
+            unreadable(spec, f'git: {e.strerror}')
+        if r.returncode:
+            unreadable(spec, r.stderr.strip())
+        return r.stdout
+    try:
+        return open(spec, encoding='utf-8', errors='replace').read()
+    except OSError as e:
+        unreadable(spec, e.strerror)
 
 def strip_comment(line):
     out, q = [], None
@@ -81,7 +98,7 @@ def main():
         sa = [s for _, s in signatures(read_spec(a.diff[0]))]
         sb = [s for _, s in signatures(read_spec(a.diff[1]))]
         d = list(difflib.unified_diff(sa, sb, a.diff[0], a.diff[1], lineterm='', n=0))
-        print('\n'.join(d))
+        if d: print('\n'.join(d))
         sys.exit(1 if d else 0)
     if not a.specs: ap.error('no input specs')
     for spec in a.specs:
