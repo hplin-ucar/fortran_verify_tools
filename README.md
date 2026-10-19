@@ -126,19 +126,21 @@ List the portable file first: when the wrapper keeps a same-named marshal
 routine, the first target wins and `(also in ...)` is appended.
 
 ```
+cd /path/to/CAM     # cam_development; the original file exists only at the old tag
 fbody --walk cam6_4_189:src/chemistry/aerosol/aero_convproc.F90 \
-      src/chemistry/aerosol/aero_convproc.F90 src/chemistry/aerosol/aero_convproc_cam.F90 \
-      --rename aero_convproc_tend=aero_convproc_run --show
+      src/chemistry/aerosol/aero_convproc_cam.F90 \
+      /path/to/atmospheric_physics:main:schemes/aerosol/core/aero_convproc.F90 \
+      --map r8=kind_phys --rename aero_convproc_tend=aero_convproc_run
+#   IDENTICAL  aero_convproc_readnl   subroutine   43 -> 43    src/chemistry/aerosol/aero_convproc_cam.F90
+#   DIFF 14    aero_convproc_init     subroutine  142 -> 143   src/chemistry/aerosol/aero_convproc_cam.F90
+#   ...
+#   DIFF 585   aero_convproc_tend     subroutine  926 -> 919   /path/to/atmospheric_physics:main:...:aero_convproc_run
 ```
 
-After the portable file is transferred to another repository and its kinds
-swept, check it again at fixed commits in both repos:
-
-```
-fbody --walk <pre-move-sha>:src/chemistry/aerosol/aero_convproc.F90 \
-      ~/devel/atmospheric_physics:<atmos-phys-sha>:schemes/modal_aero/aero_convproc.F90 \
-      --map r8=kind_phys
-```
+The wrapper routines that stayed in CAM come back IDENTICAL or with a few lines
+of host glue; the portable routines show the aerosol-object refactor that the
+port made on purpose. Add `--show` to read those diffs. The `DIR:REV:PATH` form
+pins both repositories to fixed commits, which is what a PR description wants.
 
 Read every `DIFF` with `--show` and confirm each changed statement is host
 decoupling and not science: dimensions and constants threaded as arguments,
